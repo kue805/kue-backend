@@ -146,7 +146,7 @@ async def navigate(request: Request):
                 "model": "base",
                 "language": "babel-en",
                 "voicemail_action": "hangup",
-                "webhook": "https://hardcopy-backlit-impolite.ngrok-free.dev/bland-webhook",
+                "webhook": "https://kue-backend-7b61.onrender.com/bland-webhook",
                 "metadata": {
                     "company_id": company_id,
                     "goal": goal,
@@ -208,7 +208,7 @@ async def discovery_start_logic(company, user_phone, goal, context=None):
                 "model": "base",
                 "language": "babel-en",
                 "voicemail_action": "hangup",
-                "webhook": "https://hardcopy-backlit-impolite.ngrok-free.dev/bland-webhook",
+                "webhook": "https://kue-backend-7b61.onrender.com/bland-webhook",
                 "metadata": {
                     "company_id": company.get("id"),
                     "goal": goal,
