@@ -4,6 +4,7 @@ from dotenv import load_dotenv
 import httpx
 import os
 import json
+import re
 
 load_dotenv()
 
@@ -100,6 +101,120 @@ def build_task_prompt(company_name: str, goal: str, user_phone: str, context: di
         f"Say nothing and wait silently. The call will be transferred automatically.\n\n"
         f"You have maximum 8 minutes. Navigate efficiently."
     )
+
+# ── TREE MAPPER: parse transcript into IVR steps ─────────
+async def map_transcript_to_tree(company_id: str, transcript: str, goal: str):
+    if not transcript or not company_id:
+        return
+
+    print(f"Tree Mapper running for company {company_id}")
+
+    # Use Claude to extract structured IVR steps from transcript
+    async with httpx.AsyncClient() as client:
+        response = await client.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "x-api-key": ANTHROPIC_API_KEY,
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json"
+            },
+            json={
+                "model": "claude-sonnet-4-20250514",
+                "max_tokens": 800,
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": (
+                            f"Below is a transcript of an AI navigating an IVR phone system.\n"
+                            f"Extract only the real IVR navigation steps — the prompts the system "
+                            f"played and the actions taken.\n\n"
+                            f"Ignore: hold music descriptions, advertisements, company announcements, "
+                            f"AI waiting messages.\n\n"
+                            f"Include only: menu prompts heard and button presses or spoken responses.\n\n"
+                            f"Respond with JSON only:\n"
+                            f"{{\n"
+                            f"  \"steps\": [\n"
+                            f"    {{\n"
+                            f"      \"step_number\": 1,\n"
+                            f"      \"prompt_text\": \"what the IVR said\",\n"
+                            f"      \"action_type\": \"press or say or wait\",\n"
+                            f"      \"action_value\": \"the button pressed or words spoken\"\n"
+                            f"    }}\n"
+                            f"  ]\n"
+                            f"}}\n\n"
+                            f"TRANSCRIPT:\n{transcript[:3000]}"
+                        )
+                    }
+                ]
+            },
+            timeout=20.0
+        )
+        result = response.json()
+
+    try:
+        text = result["content"][0]["text"]
+        parsed = json.loads(text)
+        steps = parsed.get("steps", [])
+    except Exception as e:
+        print(f"Tree Mapper parse error: {e}")
+        return
+
+    if not steps:
+        print("Tree Mapper: no steps extracted")
+        return
+
+    print(f"Tree Mapper: extracted {len(steps)} steps")
+
+    # Check if a discovery tree already exists for this company
+    async with httpx.AsyncClient() as client:
+        tree_res = await client.get(
+            f"{SUPABASE_URL}/rest/v1/ivr_trees?company_id=eq.{company_id}"
+            f"&department=eq.discovery&limit=1",
+            headers=HEADERS_DB
+        )
+        existing_trees = tree_res.json()
+
+        if existing_trees:
+            tree_id = existing_trees[0]["id"]
+            print(f"Tree Mapper: updating existing discovery tree {tree_id}")
+            # Delete old discovery steps and replace with new ones
+            await client.delete(
+                f"{SUPABASE_URL}/rest/v1/ivr_steps?tree_id=eq.{tree_id}"
+                f"&source_tag=eq.discovery",
+                headers=HEADERS_DB
+            )
+        else:
+            # Create new discovery tree
+            tree_result = await client.post(
+                f"{SUPABASE_URL}/rest/v1/ivr_trees",
+                headers=HEADERS_DB,
+                json={
+                    "company_id": company_id,
+                    "department": "discovery"
+                }
+            )
+            tree_data = tree_result.json()
+            tree_id = tree_data[0]["id"]
+            print(f"Tree Mapper: created new discovery tree {tree_id}")
+
+        # Insert extracted steps
+        for step in steps:
+            await client.post(
+                f"{SUPABASE_URL}/rest/v1/ivr_steps",
+                headers=HEADERS_DB,
+                json={
+                    "tree_id": tree_id,
+                    "step_number": step.get("step_number"),
+                    "prompt_text": step.get("prompt_text"),
+                    "action_type": step.get("action_type", "say"),
+                    "action_value": step.get("action_value", ""),
+                    "confidence_score": 30,
+                    "source_tag": "discovery",
+                    "discovery_mode": True
+                }
+            )
+
+    print(f"Tree Mapper: complete. {len(steps)} steps saved for company {company_id}")
 
 
 # ── POST /navigate — Autopilot call with known tree ───────
@@ -298,20 +413,28 @@ async def bland_webhook(request: Request):
     status = body.get("status")
     metadata = body.get("metadata", {})
     transcript = body.get("transcript", "")
+    company_id = metadata.get("company_id")
+    goal = metadata.get("goal", "")
+    mode = metadata.get("mode", "")
 
-    print(f"Webhook received: call_id={call_id} status={status}")
+    print(f"Webhook received: call_id={call_id} status={status} mode={mode}")
 
+    # Log to call_logs
     async with httpx.AsyncClient() as client:
         await client.post(
             f"{SUPABASE_URL}/rest/v1/call_logs",
             headers=HEADERS_DB,
             json={
-                "company_id": metadata.get("company_id"),
-                "goal": metadata.get("goal"),
+                "company_id": company_id,
+                "goal": goal,
                 "outcome": "success" if status == "completed" else "partial",
-                "discovery_mode": metadata.get("mode") == "discovery",
+                "discovery_mode": mode == "discovery",
                 "transcript": transcript
             }
         )
+
+    # Run Tree Mapper only on Discovery calls that completed
+    if mode == "discovery" and status == "completed" and company_id and transcript:
+        await map_transcript_to_tree(company_id, transcript, goal)
 
     return {"received": True}
