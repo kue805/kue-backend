@@ -272,6 +272,19 @@ async def navigate(request: Request):
         result = bland_res.json()
         print(f"Bland response: {bland_res.status_code} - {result}")
 
+        # Create initial call status record
+        new_call_id = result.get("call_id")
+        if new_call_id:
+            await client.post(
+                f"{SUPABASE_URL}/rest/v1/call_status",
+                headers=HEADERS_DB,
+                json={
+                    "call_id": new_call_id,
+                    "company_id": company_id,
+                    "status": "navigating"
+                }
+            )
+
     return {
         "status": "call_initiated",
         "call_id": result.get("call_id"),
@@ -432,6 +445,18 @@ async def bland_webhook(request: Request):
                 "transcript": transcript
             }
         )
+
+        # Update call status for real-time frontend
+        if status == "completed" and metadata.get("transferred"):
+            await client.post(
+                f"{SUPABASE_URL}/rest/v1/call_status",
+                headers=HEADERS_DB,
+                json={
+                    "call_id": call_id,
+                    "company_id": company_id,
+                    "status": "transferred"
+                }
+            )
 
     # Run Tree Mapper only on Discovery calls that completed
     if mode == "discovery" and status == "completed" and company_id and transcript:
