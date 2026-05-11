@@ -97,8 +97,8 @@ def build_task_prompt(company_name: str, goal: str, user_phone: str, context: di
         f"- If stuck or in a loop: press 0\n"
         f"- If asked why calling: say '{goal}'\n\n"
         f"WHEN HUMAN ANSWERS:\n"
-        f"Say nothing and wait silently. The call will be transferred automatically.\n\n"
-        f"You have maximum 8 minutes. Navigate efficiently."
+        f"Immediately say 'One moment please, transferring now.' then go silent.\n"
+        f"Do not say anything else after that.\n\n"
     )
 
 # ── HELPER: update call status ────────────────────────────
