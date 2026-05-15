@@ -67,7 +67,7 @@ async def get_company(company_id: str):
         data = res.json()
         return data[0] if data else None
 
-# ── HELPER: normalize goal to IVR-friendly phrase ─────────
+# ── HELPER: normalize goal ────────────────────────────────
 def normalize_goal(goal: str) -> str:
     goal_lower = goal.lower().strip()
     if any(x in goal_lower for x in ["talk to a human", "speak to someone", "talk to someone", "human", "agent", "representative"]):
@@ -81,6 +81,15 @@ def normalize_goal(goal: str) -> str:
     if any(x in goal_lower for x in ["upgrade", "new phone", "new device", "new service"]):
         return "upgrade"
     return goal
+
+# ── HELPER: normalize phone number ───────────────────────
+def normalize_phone(phone: str) -> str:
+    digits = "".join(filter(str.isdigit, phone))
+    if len(digits) == 10:
+        return f"+1{digits}"
+    elif len(digits) == 11 and digits.startswith("1"):
+        return f"+{digits}"
+    return phone
 
 # ── HELPER: build task prompt ─────────────────────────────
 def build_task_prompt(company_name: str, goal: str, user_phone: str, context: dict = None):
@@ -384,6 +393,7 @@ async def discovery_start_logic(company, user_phone, goal, context=None):
         "mode": "discovery"
     }
 
+
 # ── POST /navigate-custom — call any phone number ─────────
 @app.post("/navigate-custom")
 async def navigate_custom(request: Request):
@@ -397,13 +407,7 @@ async def navigate_custom(request: Request):
     if not target_phone or not user_phone:
         return {"error": "user_phone and target_phone are required"}
 
-    # Normalize target phone
-    digits = "".join(filter(str.isdigit, target_phone))
-    if len(digits) == 10:
-        target_phone = f"+1{digits}"
-    elif len(digits) == 11 and digits.startswith("1"):
-        target_phone = f"+{digits}"
-
+    target_phone = normalize_phone(target_phone)
     task = build_task_prompt(company_name, goal, user_phone, context)
 
     async with httpx.AsyncClient() as client:
@@ -461,31 +465,27 @@ async def hold_takeover(request: Request):
     user_phone = body.get("user_phone")
     target_phone = body.get("target_phone")
     company_name = body.get("company_name", "this company")
+    company_id = body.get("company_id")
     department = body.get("department", "customer service")
     context = body.get("context", {})
 
     if not target_phone or not user_phone:
         return {"error": "user_phone and target_phone are required"}
 
-    # Normalize target phone
-    digits = "".join(filter(str.isdigit, target_phone))
-    if len(digits) == 10:
-        target_phone = f"+1{digits}"
-    elif len(digits) == 11 and digits.startswith("1"):
-        target_phone = f"+{digits}"
+    target_phone = normalize_phone(target_phone)
 
-    # Hold takeover prompt - skip IVR navigation, just wait silently
     task = (
-        f"You are taking over a hold for a customer who was waiting on hold with {company_name} "
+        f"You are taking over a hold for a customer waiting with {company_name} "
         f"for the {department} department.\n\n"
-        f"IMPORTANT: You are NOT navigating an IVR. The customer was already connected and on hold.\n\n"
-        f"Your job is simple:\n"
-        f"- If you hear hold music or silence: wait patiently\n"
-        f"- If the IVR plays options: press 0 or say 'representative' to get back to the hold queue\n"
-        f"- If a human answers: say 'One moment please, transferring now' then go completely silent\n"
-        f"- The call will transfer to the customer automatically when a human is detected\n\n"
-        f"Do not navigate any menus. Do not say anything unless a human answers.\n"
-        f"Just wait silently until a human picks up."
+        f"IMPORTANT: You are NOT navigating an IVR from scratch. "
+        f"The customer was already connected and placed on hold.\n\n"
+        f"Your job:\n"
+        f"- If you hear hold music or silence: wait patiently and silently\n"
+        f"- If the IVR plays menu options: press 0 or say 'representative' to get back to hold\n"
+        f"- If a human answers: immediately say 'One moment please, transferring now' then go silent\n"
+        f"- The call transfers to the customer automatically when a human is detected\n\n"
+        f"Do not navigate menus unless forced to. Just wait silently until a human picks up.\n"
+        f"You have up to 12 minutes."
     )
 
     async with httpx.AsyncClient() as client:
@@ -514,7 +514,7 @@ async def hold_takeover(request: Request):
                 "voicemail_action": "hangup",
                 "webhook": "https://kue-backend-7b61.onrender.com/bland-webhook",
                 "metadata": {
-                    "company_id": None,
+                    "company_id": company_id,
                     "company_name": company_name,
                     "goal": f"hold takeover for {department}",
                     "mode": "hold_takeover"
@@ -526,7 +526,7 @@ async def hold_takeover(request: Request):
 
     new_call_id = result.get("call_id")
     if new_call_id:
-        await update_call_status(new_call_id, None, "navigating")
+        await update_call_status(new_call_id, company_id, "navigating")
 
     return {
         "status": "hold_takeover_initiated",
@@ -534,6 +534,8 @@ async def hold_takeover(request: Request):
         "company": company_name,
         "mode": "hold_takeover"
     }
+
+
 # ── POST /reason-goal — Claude infers department ──────────
 @app.post("/reason-goal")
 async def reason_goal(request: Request):
@@ -604,7 +606,7 @@ async def bland_webhook(request: Request):
     call_id = body.get("call_id")
     status = body.get("status")
     metadata = body.get("metadata", {})
-    transcript = body.get("transcript", "")
+    transcript = body.get("concatenated_transcript") or body.get("transcript", "")
     company_id = metadata.get("company_id")
     goal = metadata.get("goal", "")
     mode = metadata.get("mode", "")
@@ -629,17 +631,17 @@ async def bland_webhook(request: Request):
                 "company_id": company_id,
                 "goal": goal,
                 "outcome": call_outcome,
-                "discovery_mode": mode == "discovery",
+                "discovery_mode": mode in ["discovery", "hold_takeover"],
                 "transcript": transcript
             }
         )
 
     # Update real-time call status
-    if call_id and company_id:
+    if call_id:
         await update_call_status(call_id, company_id, call_outcome)
 
-    # Run Tree Mapper on Discovery calls
-    if mode == "discovery" and status == "completed" and company_id and transcript:
+    # Run Tree Mapper on Discovery AND Hold Takeover calls
+    if mode in ["discovery", "hold_takeover"] and status == "completed" and company_id and transcript:
         await map_transcript_to_tree(company_id, transcript, goal)
 
     return {"received": True}
