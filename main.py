@@ -67,11 +67,28 @@ async def get_company(company_id: str):
         data = res.json()
         return data[0] if data else None
 
+# ── HELPER: normalize goal to IVR-friendly phrase ─────────
+def normalize_goal(goal: str) -> str:
+    goal_lower = goal.lower().strip()
+    if any(x in goal_lower for x in ["talk to a human", "speak to someone", "talk to someone", "human", "agent", "representative"]):
+        return "customer service"
+    if any(x in goal_lower for x in ["technical", "tech support", "not working", "broken", "outage", "internet", "signal"]):
+        return "technical support"
+    if any(x in goal_lower for x in ["bill", "billing", "payment", "charge", "pay my bill", "dispute"]):
+        return "billing"
+    if any(x in goal_lower for x in ["cancel", "cancellation", "disconnect"]):
+        return "cancel service"
+    if any(x in goal_lower for x in ["upgrade", "new phone", "new device", "new service"]):
+        return "upgrade"
+    return goal
+
 # ── HELPER: build task prompt ─────────────────────────────
 def build_task_prompt(company_name: str, goal: str, user_phone: str, context: dict = None):
     product_type = context.get("product_type", "mobile") if context else "mobile"
     account_type = context.get("account_type", "personal") if context else "personal"
     known_questions = context.get("known_questions", []) if context else []
+
+    normalized = normalize_goal(goal)
 
     if known_questions:
         known_qa = "\n".join([
@@ -85,7 +102,7 @@ def build_task_prompt(company_name: str, goal: str, user_phone: str, context: di
         )
 
     return (
-        f"You are calling {company_name} on behalf of a customer. Goal: {goal}\n\n"
+        f"You are calling {company_name} on behalf of a customer. Goal: {normalized}\n\n"
         f"BUTTON PRESSING RULES:\n"
         f"- When you decide to press a button, execute it immediately and silently\n"
         f"- Do NOT announce what you are pressing, just press it\n\n"
@@ -94,11 +111,13 @@ def build_task_prompt(company_name: str, goal: str, user_phone: str, context: di
         f"- If asked for account number: say 'I do not have that information available'\n"
         f"- If offered callback vs hold: press 3 or say you want to hold for a representative\n"
         f"- If asked about text or link offers: say 'No, I need to speak with a human agent'\n"
+        f"- If the IVR asks what you need and none of the options match: say 'customer service'\n"
         f"- If stuck or in a loop: press 0\n"
-        f"- If asked why calling: say '{goal}'\n\n"
+        f"- If asked why calling: say '{normalized}'\n\n"
         f"WHEN HUMAN ANSWERS:\n"
-        f"Immediately say 'One moment please, transferring now.' then go silent.\n"
+        f"Immediately say 'One moment please, transferring now.' then go completely silent.\n"
         f"Do not say anything else after that.\n\n"
+        f"You have maximum 8 minutes. Navigate efficiently."
     )
 
 # ── HELPER: update call status ────────────────────────────
@@ -106,7 +125,6 @@ async def update_call_status(call_id: str, company_id: str, status: str):
     if not call_id:
         return
     async with httpx.AsyncClient() as client:
-        # Check if row exists
         check = await client.get(
             f"{SUPABASE_URL}/rest/v1/call_status?call_id=eq.{call_id}&limit=1",
             headers=HEADERS_DB
@@ -117,7 +135,7 @@ async def update_call_status(call_id: str, company_id: str, status: str):
             await client.patch(
                 f"{SUPABASE_URL}/rest/v1/call_status?call_id=eq.{call_id}",
                 headers={**HEADERS_DB, "Prefer": "return=minimal"},
-                json={"status": status, "updated_at": "now()"}
+                json={"status": status}
             )
         else:
             await client.post(
@@ -366,7 +384,156 @@ async def discovery_start_logic(company, user_phone, goal, context=None):
         "mode": "discovery"
     }
 
+# ── POST /navigate-custom — call any phone number ─────────
+@app.post("/navigate-custom")
+async def navigate_custom(request: Request):
+    body = await request.json()
+    user_phone = body.get("user_phone")
+    target_phone = body.get("target_phone")
+    company_name = body.get("company_name", "this company")
+    goal = body.get("goal", "reach a human agent")
+    context = body.get("context", {})
 
+    if not target_phone or not user_phone:
+        return {"error": "user_phone and target_phone are required"}
+
+    # Normalize target phone
+    digits = "".join(filter(str.isdigit, target_phone))
+    if len(digits) == 10:
+        target_phone = f"+1{digits}"
+    elif len(digits) == 11 and digits.startswith("1"):
+        target_phone = f"+{digits}"
+
+    task = build_task_prompt(company_name, goal, user_phone, context)
+
+    async with httpx.AsyncClient() as client:
+        bland_res = await client.post(
+            "https://api.bland.ai/v1/calls",
+            headers={
+                "authorization": BLAND_API_KEY,
+                "Content-Type": "application/json"
+            },
+            json={
+                "phone_number": target_phone,
+                "task": task,
+                "transfer_phone_number": user_phone,
+                "transfer_list": {
+                    "human_detected": user_phone
+                },
+                "answered_by_enabled": True,
+                "wait_for_greeting": True,
+                "max_duration": 8,
+                "record": True,
+                "noise_cancellation": False,
+                "interruption_threshold": 500,
+                "block_interruptions": False,
+                "model": "base",
+                "language": "babel-en",
+                "voicemail_action": "hangup",
+                "webhook": "https://kue-backend-7b61.onrender.com/bland-webhook",
+                "metadata": {
+                    "company_id": None,
+                    "company_name": company_name,
+                    "goal": goal,
+                    "mode": "custom"
+                }
+            }
+        )
+        result = bland_res.json()
+        print(f"Custom call response: {bland_res.status_code} - {result}")
+
+    new_call_id = result.get("call_id")
+    if new_call_id:
+        await update_call_status(new_call_id, None, "navigating")
+
+    return {
+        "status": "call_initiated",
+        "call_id": new_call_id,
+        "company": company_name,
+        "mode": "custom"
+    }
+
+
+# ── POST /hold-takeover — take over an existing hold ──────
+@app.post("/hold-takeover")
+async def hold_takeover(request: Request):
+    body = await request.json()
+    user_phone = body.get("user_phone")
+    target_phone = body.get("target_phone")
+    company_name = body.get("company_name", "this company")
+    department = body.get("department", "customer service")
+    context = body.get("context", {})
+
+    if not target_phone or not user_phone:
+        return {"error": "user_phone and target_phone are required"}
+
+    # Normalize target phone
+    digits = "".join(filter(str.isdigit, target_phone))
+    if len(digits) == 10:
+        target_phone = f"+1{digits}"
+    elif len(digits) == 11 and digits.startswith("1"):
+        target_phone = f"+{digits}"
+
+    # Hold takeover prompt - skip IVR navigation, just wait silently
+    task = (
+        f"You are taking over a hold for a customer who was waiting on hold with {company_name} "
+        f"for the {department} department.\n\n"
+        f"IMPORTANT: You are NOT navigating an IVR. The customer was already connected and on hold.\n\n"
+        f"Your job is simple:\n"
+        f"- If you hear hold music or silence: wait patiently\n"
+        f"- If the IVR plays options: press 0 or say 'representative' to get back to the hold queue\n"
+        f"- If a human answers: say 'One moment please, transferring now' then go completely silent\n"
+        f"- The call will transfer to the customer automatically when a human is detected\n\n"
+        f"Do not navigate any menus. Do not say anything unless a human answers.\n"
+        f"Just wait silently until a human picks up."
+    )
+
+    async with httpx.AsyncClient() as client:
+        bland_res = await client.post(
+            "https://api.bland.ai/v1/calls",
+            headers={
+                "authorization": BLAND_API_KEY,
+                "Content-Type": "application/json"
+            },
+            json={
+                "phone_number": target_phone,
+                "task": task,
+                "transfer_phone_number": user_phone,
+                "transfer_list": {
+                    "human_detected": user_phone
+                },
+                "answered_by_enabled": True,
+                "wait_for_greeting": True,
+                "max_duration": 12,
+                "record": True,
+                "noise_cancellation": False,
+                "interruption_threshold": 500,
+                "block_interruptions": False,
+                "model": "base",
+                "language": "babel-en",
+                "voicemail_action": "hangup",
+                "webhook": "https://kue-backend-7b61.onrender.com/bland-webhook",
+                "metadata": {
+                    "company_id": None,
+                    "company_name": company_name,
+                    "goal": f"hold takeover for {department}",
+                    "mode": "hold_takeover"
+                }
+            }
+        )
+        result = bland_res.json()
+        print(f"Hold takeover response: {bland_res.status_code} - {result}")
+
+    new_call_id = result.get("call_id")
+    if new_call_id:
+        await update_call_status(new_call_id, None, "navigating")
+
+    return {
+        "status": "hold_takeover_initiated",
+        "call_id": new_call_id,
+        "company": company_name,
+        "mode": "hold_takeover"
+    }
 # ── POST /reason-goal — Claude infers department ──────────
 @app.post("/reason-goal")
 async def reason_goal(request: Request):
